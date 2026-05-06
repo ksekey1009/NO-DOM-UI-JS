@@ -1,0 +1,69 @@
+[IME 전용 설계 명세] 원자적 상태 머신 및 슬롯 제어 시스템
+본 명세는 텍스트 커널로 데이터를 이관하기 전, 입력 이벤트의 상태 전이와 조합(Composition)을 담당하는 IME의 내부 구조만을 규정한다.
+1. IME 구조적 불변 조건 (Immutable Constraints)
+IME는 데이터를 영구 보존하지 않는 휘발성 상태 머신으로 동작하며, 다음 세 영역의 격리를 유지한다.
+구성 요소	역할 및 성격	데이터 생명주기
+Input Buffer	물리 키 입력(KeyCode)의 원시 시퀀스 기록	조합 중 유지, Commit/Cancel 시 즉시 파기
+Preedit Buffer	현재 슬롯 상태를 시각적 문자(3-byte Unit)로 환원한 출력 대기열	조합 갱신 시마다 덮어쓰기(Overwrite)
+Language Ruleset	슬롯 점유 규칙 및 상태 전이 매핑 테이블	시스템 로드 시 메모리 상주 (Read-Only)
+2. 슬롯 기반 상태 모델 (Slot-based State Machine)
+IME의 핵심은 3개의 논리 슬롯이며, 상태는 슬롯의 값(Value)이 아닌 점유 여부(Occupancy)로 판정한다.
+2.1. 슬롯 점유 및 상태 정의
+슬롯 인덱스	논리적 단계	점유 조건 (Ruleset 기반)	상태 전이 트리거
+Slot 0	Leading (초성)	입력 시퀀스의 시작	(1, 0, 0) : 조합 개시
+Slot 1	Nucleus (중성)	Slot 0 점유 중 유효한 모음/결합문자 유입	(1, 1, 0) : 조합 중
+Slot 2	Trailing (종성)	Slot 1 점유 중 유효한 종성/받침 유입	(1, 1, 1) : 조합 완료 직전
+2.2. 상태 전이 불변 규칙
+순차 점유: Slot n은 Slot n-1이 점유된 상태에서만 활성화될 수 있다.
+역전이(Rollback): Backspace 입력 시 Slot n이 존재하면 Slot n만 비우며, Slot n이 비어있을 때만 Slot n-1을 수정한다.
+원자적 파기: 어떤 이유로든 조합이 취소(Cancel)되면 모든 슬롯은 즉시 Null로 회귀한다.
+
+3. 언어별 룰셋 인터페이스 (Language Ruleset Header)
+IME Core가 언어별 세부 로직을 알지 못해도 상태를 제어할 수 있도록 힌트 비트필드를 제공한다.
+3.1. Capability Hint Bitfield (8-bit) 명세
+비트	명칭	1 (True)의 의미	0 (False)의 의미
+bit 7	S0_REQ	Slot 0(초성) 필수 사용	Slot 0 생략 가능
+bit 6	S0_COMP	Slot 0 자체 조합 규칙 존재	Slot 0 단순 매핑
+bit 5	S1_REQ	Slot 1(중성) 필수 사용	Slot 1 생략 가능
+bit 4	S1_COMP	Slot 1 자체 조합 규칙 존재	Slot 1 단순 매핑
+bit 3	S2_REQ	Slot 2(종성) 필수 사용	Slot 2 미사용 (2슬롯 체계)
+bit 2	S2_COMP	Slot 2 자체 조합 규칙 존재	Slot 2 단순 매핑
+bit 1	CASE_SEP	대소문자(Upper/Lower) 분리 처리	구분 없음
+bit 0	SPEC_KEY	특수키/기능키 조합 모드 활성화	일반 입력 모드
+4. 룰셋 바이트 스트림 및 상태 전이 (Ruleset Byte Stream)
+룰셋은 문자가 아닌 '상태 전이 정보'를 바이트 스트림으로 내장한다.
+전이 튜플(Transition Tuple): 모든 룰셋 유닛은 [현재 슬롯 상태 + 유입 키코드] → [차기 슬롯 상태 + 변환 결과]를 쌍으로 보유한다.
+추적 가능성: 룰셋 정보만으로 현재 조합이 '완성형'인지 '진행형'인지 즉시 판별 가능해야 한다.
+결과 스트림: 조합 완료(Commit) 시 룰셋은 3개 슬롯의 최종 결과물을 3바이트 유닛 스트림으로 방출한다.
+
+5. IME 외부 상호작용 및 경계 규칙 (Interaction Rules)
+5.1. Commit / Cancel 조건
+자동 Commit: 유입된 키코드가 현재 룰셋의 Slot 0~2 어디에도 배치될 수 없는 경우, 기존 버퍼를 Commit하고 새로운 조합을 시작한다.
+강제 Commit: Enter, Space 등 제어 키 유입 시 현재 버퍼 상태를 확정하고 종료한다.
+포커스 유실: 입력 포커스가 이동할 경우, 현재 Preedit 내용을 즉시 파기하거나 확정하는 정책은 룰셋의 설정에 따른다.
+5.2. Undo / Redo 관측 원칙
+IME는 스스로 히스토리를 저장하지 않는다.
+외부(System)로부터 Undo 명령을 수신하면, IME는 "현재 조합 중인 상태(Preedit)"를 즉시 폐기하는 것으로 책임을 완수한다.
+6. 핵심 요약: IME 책임 한계
+데이터 비소비: IME는 키코드를 소모하여 사라지게 하지 않고, 슬롯 상태를 변화시키는 트리거로만 사용한다.
+문자열 미생성: IME는 완성된 텍스트 스트링을 만들지 않으며, 오직 3바이트 원자적 슬롯 결과물만을 출력한다.
+상태 전이 전담: IME의 유일한 존재 이유는 유입된 이벤트가 어느 슬롯에 어느 값으로 안착할지를 결정하는 것이다.
+
+[물리적 연동: Core Register Map ↔ IME Buffer]
+Core Index	IME 논리 슬롯 / 기능	연결 규정 (Constraint)
+112	IME_STATUS	슬롯 점유 상태 (1,1,0 등) 및 8-bit Capability Hint 기록
+113	SLOT_0 (Leading)	조합 중인 초성/시작 유닛 (Ruleset 변환 결과)
+114	SLOT_1 (Nucleus)	조합 중인 중성/중간 유닛 (Ruleset 변환 결과)
+115	SLOT_2 (Trailing)	조합 중인 종성/최종 유닛 (Ruleset 변환 결과)
+116	INPUT_LAST	가장 최근 유입된 원시 KeyCode (Input Buffer의 최상단)
+117	PREEDIT_PTR	Preedit Buffer 내 현재 출력 위치 포인터
+118~119	SYS_IME_WORK	룰셋 전이 계산을 위한 임시 워크 슬롯 (Shadow)
+[절차적 연동: 이벤트 흐름]
+입력 (Input): 외부 키 이벤트가 발생하면 INPUT_LAST(116)에 기록됩니다.
+전이 (Transition): IME 상태 머신이 Ruleset을 참조하여 IME_STATUS(112)의 점유 비트와 SLOT 0~2(113~115)의 값을 원자적으로 갱신합니다.
+출력 대기 (Preedit): 갱신된 슬롯 값은 즉시 Preedit Buffer로 투영되어 화면에 표시될 준비를 마칩니다.
+확정 (Commit): 자동/강제 Commit 조건 충족 시, SLOT 0~2의 데이터가 3바이트 유닛 스트림으로 방출되며 모든 IME 관련 레지스터(112~119)는 Null(0)로 회귀합니다.
+[연동 불변 규칙]
+상태 동기화: IME_STATUS의 점유 비트와 실제 SLOT 레지스터의 유효 데이터는 항상 일치해야 합니다.
+직접 수정 금지: 외부(System/UI) 로직은 IME_BUFFER 영역을 직접 수정할 수 없으며, 오직 이벤트를 통한 상태 전이 결과로서만 값이 변경됩니다.
+휘발성: 조합 종료 시 레지스터 영역은 즉시 초기화되며, 어떤 잔류 데이터도 다음 조합에 영향을 미쳐서는 안 됩니다.
