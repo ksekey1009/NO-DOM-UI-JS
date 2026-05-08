@@ -1,0 +1,183 @@
+# DataManager 구현 진행 메모
+
+## 목표
+- JS 저수준 유사 커널 UI 시스템에서 `DataManager`를 메모리 명세와 1:1로 일치시킨다.
+- 핫패스(매 프레임 자주 실행되는 경로)는 매니저 실행부로 집중한다.
+- UI 클래스는 가볍게 유지하고, 상태 변경은 커맨드 큐를 통해 매니저가 처리한다.
+
+## 합의된 원칙
+1. **메모리 고정 오프셋 우선**
+   - 노드별 워드 오프셋은 상수로 고정한다.
+   - 대부분 데이터 필드는 고정 위치를 사용하며, 텍스트만 가변 길이로 처리한다.
+
+2. **텍스트 처리 분리**
+   - 텍스트 저장은 `Uint8Array` 바이트 스트림 기반으로 유지한다.
+   - 출력 시점에서 UTF-8 1/2/3/4 바이트 문자를 디코딩해 사용한다.
+
+3. **정수 opcode 사용**
+   - 내부 커맨드 처리 opcode는 문자열 대신 정수 상수로 통일한다.
+   - 문자열 명령 기반 분기(`"SET_*"`)는 핫패스에서 배제한다.
+
+4. **명확한 네이밍 유지(현 단계)**
+   - 현재는 Codex 작업 안정성을 위해 긴 이름과 명시적 이름을 사용한다.
+   - 축약/난독화는 구현 안정화 이후 별도 단계로 분리한다.
+
+5. **상속 대신 기능 조합 기반 타입 정책**
+   - 타입(`.t`)별로 기능을 조합해 “상속과 유사한 역할 분리”를 구현한다.
+   - 클래스 분기보다 `DataManager` 정책 테이블 조회를 우선한다.
+
+## 현재 반영된 구현 상태
+- `ui_`에 `typeId(.t)`를 도입하고 기본값 `UIBASE = 0`으로 초기화.
+- `ui_`에서 타입 정책 질의 함수 제공:
+  - `can_use(managerFunctionId)`
+  - `can_copy_text()`
+  - `can_edit_text()`
+  - `get_numeric_unit()`
+  - `get_policy()`
+- `DataManager` 타입 정책 구조 반영:
+  - `managerFunctions: Set<number>`
+  - `features: Set<number>`
+  - `numericUnit: number`
+- 정책 API:
+  - `registerTypeCapabilities(typeId, managerFunctionIds)`
+  - `registerTypePolicy(typeId, policy)`
+  - `canTypeUse(typeId, managerFunctionId)`
+  - `canTypeUseFeature(typeId, featureId)`
+  - `getNumericUnit(typeId)`
+  - `getTypePolicy(typeId)`
+
+## feature / numeric unit 규칙
+### FEATURE
+- `TEXT_COPY`
+- `TEXT_EDIT`
+- `NUMERIC_BIT`
+- `NUMERIC_NIBBLE`
+- `NUMERIC_BYTE`
+- `NUMERIC_WORD`
+- `NUMERIC_DWORD`
+
+### NUMERIC_UNIT
+- `BIT (1)`
+- `NIBBLE (4)`
+- `BYTE (8)`
+- `WORD (16)`
+- `DWORD (32)`
+
+## 2차 구현 범위(다음 커밋 대상)
+- 커맨드 큐(opcode 정수 기반) 실동작 경로 연결
+- 타입 프리셋 정의 (`TYPE_TEXT_READONLY`, `TYPE_TEXT_EDITABLE`, `TYPE_NUMERIC_BITFIELD` 등)
+- 텍스트 정책과 입력 매니저 연동(복사/수정 금지 규칙 강제)
+- numeric unit 별 연산 헬퍼(bit/nibble/byte/word/dword) 정식 도입
+
+## 제외/보류
+- 디버그 덤프 전용 도구
+- 변수명 축약/난독화
+- 렌더러/입력 매니저 고도화 전체
+
+## 작업 방식
+- 작은 단위로 MD 문서와 함께 커밋한다.
+- 명세 정합성 우선, 성능 미세 최적화는 이후 단계에서 수행한다.
+
+
+## 처리 전담 매니저 분리 원칙
+- `DataManager`는 파라미터 저장/코어 상태 보존 역할에 집중한다.
+- `ProcessingManager`는 파라미터 영역 스캔 및 추상화 기능 처리에 집중한다.
+- 처리 결과만 `DataManager.commit_processed_parameter(...)`로 반영한다.
+- 목적: 역할 분리로 참조 경로를 단순화하고, 단일 매니저 과밀화를 방지한다.
+
+
+## 파라미터 처리 루프/핸드쉐이크 규칙
+- DataManager ↔ ProcessingManager는 직접 요청/응답 호출 대신 커밋 상태(handshake state)로 동기화한다.
+- 파라미터가 설정되면 `PARAM_READY`, 처리 완료 후 `PROCESSING_DONE`, 커밋 종료 시 `IDLE`로 복귀한다.
+- ProcessingManager 루프는 파라미터 시그니처가 허용 패턴과 일치할 때만 동작한다.
+- 패턴 불일치 시 즉시 스킵하여 하드웨어 자원 사용을 제한한다.
+
+## 버퍼/배열 운용 규칙 (구버전 JS 일반 규칙 반영)
+- 동적 배열 생성 금지: 실행 중 `new Array(...)` 확장을 반복하지 않는다.
+- 더미 배열이 필요하면 초기화 단계에서 고정 더미 영역을 선언하고 참조로만 사용한다.
+- 파라미터 영역은 값 읽기/쓰기가 빈번하므로, 필요한 값은 복사 후 장시간 참조를 유지하지 않는다.
+- 데이터 처리 함수는 매니저가 사전 할당한 버퍼 영역만 사용한다.
+
+
+## 추가 합의사항 (운영 규칙 v2)
+1. 처리 1회 완료 후에는 `DONE` 상태를 강제한다.
+2. 단, 프리즈/예상치 못한 버그 대응을 위해 프레임 업데이트 루프에서 렌더링 반영 직전에 `IDLE` 강제 리셋을 수행한다.
+3. 파라미터 형식 표준화는 초기에는 단순 유지(복잡화 금지), 안정성 실증 후 확장한다.
+4. 역할 분리:
+   - DataManager: 쓰기/삭제/보존
+   - ProcessingManager: opcode + `ui.t` 기반 분기 처리
+5. 동적배열 할당 금지: DataManager/각 매니저의 사전 할당 임시영역에서만 가공한다.
+
+
+## RenderManager 협업 규칙
+- RenderManager는 DataManager의 더티/뷰포트 기반 대상만 읽고 소비한다.
+- 렌더링 직전 루프에서 `ProcessingManager.force_reset_before_render()`를 호출해 커밋 상태를 안전하게 초기화한다.
+- ProcessingManager는 렌더 루프 이전에 정렬된 렌더 순서 버퍼를 준비한다(`prepare_render_materials_prior_loop`).
+- RenderManager는 필요한 데이터만 임시 버퍼로 복사해 렌더 재료를 조합하고, 외부 렌더 경계로 전달한다.
+- RenderManager는 코어 상태를 직접 변형하지 않는다(consume-only).
+
+
+## 불변조건/메모리명세 교정 기록
+- 검증 기준: 공통 불변 조건 문서 + 메모리 명세(고정 영역/사전 할당/핫패스 동적할당 억제).
+- 교정 1: ProcessingManager 처리 결과를 객체 생성 방식에서 고정 패킷(`Uint32Array`) 방식으로 전환.
+- 교정 2: DataManager 커밋 경로에 `commit_processed_packet(...)`를 추가하여 패킷 기반 반영으로 고정.
+- 효과: 핫패스에서 임시 객체 생성/가비지 압박을 줄이고, 데이터 처리 경로를 고정된 메모리 형태로 유지.
+
+
+## 커밋 경로 단일화 / Void Function 전환
+- 처리 결과 커밋은 `commit_processed_packet(...)` 단일 경로만 사용한다.
+- 파라미터 입력은 객체/가변 구조 대신 `set_parameter_slot(idx, fn, p0, p1)` 고정 슬롯을 사용한다.
+- ProcessingManager는 `scan_and_process_once()`에서 슬롯을 읽어 즉시 처리하며, 결과는 고정 패킷으로만 전달한다.
+- 렌더 준비도 `set_render_loop_context(...)` + `prepare_render_materials_prior_loop_void()` 조합으로 파라미터 전달을 최소화한다.
+- 원칙: 가능한 많은 루프 함수는 void 스타일(사전 설정된 영역 참조)로 운용한다.
+
+
+## 프레임 루프 GC 최소화 규칙 (Render)
+- 매 프레임 렌더 재료 준비는 항상 수행한다(`prepare_frame_materials`).
+- 렌더 반영 여부는 프레임 해시 비교(`should_render`)로 결정한다.
+- 재료 버퍼는 고정 길이 `Uint32Array`를 재사용하며, 쓰고 버리는 객체/배열 생성은 금지한다.
+- 변경 없음(No visual delta) 상태에서는 백엔드 렌더 호출만 생략하고, 재료 준비 루프는 유지한다.
+- 목적: 메이저 GC 빈도 상승 방지 + 프레임 타임 안정화.
+
+
+## 초기 단계 API 축소 / OPCODE 상태 확장
+- 초기 단계에서는 정책 API를 최소화하고, 내부 분기/조건식 중심으로 처리한다.
+- `Map/Set` 기반 정책 저장은 제거하고, 타입배열 기반 정책 마스크(`managerMask`, `featureMask`, `numericUnit`)로 교체한다.
+- OPCODE는 `command state`, `debug state`, `error state`, `custom state`로 분할하여 저장한다.
+- 파라미터 슬롯은 `[idx, opcode, p0, p1]`만 유지한다. `opcode=(command+debug+error+custom)`를 필요 시 즉시 decode한다.
+- 정책 API의 확장은 안정화 이후 단계에서만 허용한다.
+
+
+## 렌더 규칙 규명 / 대단위 파이프라인
+- 작은 함수 과분할 대신, 핫패스는 대단위 파이프라인 함수로 실행한다.
+- 표준 흐름:
+  1) 입력데이터 검증
+  2) OPCODE 분기
+  3) 커밋 ready
+  4) 메모리 읽기/복사
+  5) 데이터 가공
+  6) 데이터 유효성 검증
+  7) 메모리 쓰기-보존 요청
+  8) 커밋 done
+  9) 커밋 idle
+  10) 렌더 업데이트 루프
+- 렌더 단계는 조건식으로만 동작 여부를 결정한다(렌더/스킵/기타).
+- 목적: 콜스택 오버헤드 증가를 피하고, 기능 손상 없이 처리 지연을 최소화한다.
+
+
+## 매니저 역할 경계(Responsibility Boundary)
+- DataManager: 단순 데이터 읽기/쓰기/보존, 파라미터 슬롯/커밋 상태 관리만 담당한다.
+- ProcessingManager: opcode 분기, 데이터 가공, 유효성 검증, 커밋 요청 및 렌더 협업 진입을 담당한다.
+- RenderManager: DataManager 읽기 기반 재료 준비/소비/렌더 반영 결정만 담당한다.
+- IMEManager: 별도 매니저로 분리(버퍼/수명주기 규칙 별도), 본 경로와 직접 혼합하지 않는다.
+
+### 금지 규칙
+- DataManager에서 렌더링 로직 수행 금지
+- RenderManager에서 코어 상태 직접 변형 금지
+- ProcessingManager에서 코어 상태 직접 쓰기 금지(반드시 DataManager 커밋 경유)
+
+
+## 내부 경로 통일 규칙
+- 실행 경로는 `ProcessingManager.run_pipeline_once()` 단일 엔트리로 통일한다.
+- 기존 보조 경로는 래퍼로만 유지하거나 제거한다(중복 로직 금지).
+- 반영 보류 기능은 주석으로 명시하거나 삭제하여 혼동을 줄인다.
